@@ -12,16 +12,16 @@ Networking is implemented with Boost.Asio/Beast. Use `--mode pt3` for real hardw
 cmake . & make
 ```
 
-### Run
+## Run
 
 ```sh
-sudo ./lepton_ws_server --mode pt3 --port 8765
+sudo ./lepton_ws_server --mode pt3
 ```
 
-#### Dummy Mode
+### Dummy Mode
 
 ```sh
-./lepton_ws_server --mode dummy --port 8765
+./lepton_ws_server --mode dummy
 ```
 
 ### Options
