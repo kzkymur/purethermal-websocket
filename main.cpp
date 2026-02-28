@@ -5,6 +5,7 @@
 #include <boost/endian/conversion.hpp>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include <fstream>
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -53,6 +55,31 @@ static uint64_t now_us() {
   using namespace std::chrono;
   auto t = steady_clock::now().time_since_epoch();
   return (uint64_t)duration_cast<microseconds>(t).count();
+}
+
+// --- Minimal logger ---
+enum class LogLevel { INFO, WARN, ERROR };
+
+static std::mutex g_log_mu;
+
+static void log(LogLevel lv, const std::string &msg) {
+  using namespace std::chrono;
+  const auto tp = system_clock::now();
+  const auto t = system_clock::to_time_t(tp);
+  const auto us = duration_cast<microseconds>(tp.time_since_epoch()) % seconds(1);
+  char buf[64];
+  std::tm tm{};
+#if defined(_WIN32)
+  localtime_s(&tm, &t);
+#else
+  localtime_r(&t, &tm);
+#endif
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06d",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                tm.tm_hour, tm.tm_min, tm.tm_sec, (int)us.count());
+  const char *lvl = lv == LogLevel::INFO ? "INFO" : (lv == LogLevel::WARN ? "WARN" : "ERROR");
+  std::lock_guard<std::mutex> lk(g_log_mu);
+  std::clog << "[" << buf << "] [" << lvl << "] " << msg << "\n";
 }
 
 class IFrameSource {
@@ -98,6 +125,8 @@ private:
     auto next = std::chrono::steady_clock::now();
 
     // ダミー温度：背景 295.00K、移動するホットスポット 310.00K
+    // 以前はホットスポットが“ベタ塗り”だったが、より滑らかに見えるよう
+    // ここでガウシアン勾配に変更する。
     const uint16_t bgK = 29500;
     const uint16_t hotK = 31000;
 
@@ -119,17 +148,26 @@ private:
 
       f.pixels.assign((size_t)w_ * h_, bgK);
 
-      // moving hotspot
-      int cx = (int)(fid % w_);
-      int cy = (int)((fid / 2) % h_);
-      int r = 10;
+      // moving hotspot with smooth radial gradient (Gaussian)
+      // 中心は 310.00K、背景は 295.00K。半径rを目安にシグマを決め、
+      // 画素値 = bg + (hot-bg)*exp(-(d^2)/(2*sigma^2)) を適用する。
+      const int cx = static_cast<int>(fid % w_);
+      const int cy = static_cast<int>((fid / 2) % h_);
+      const double r = 12.0;                 // 見た目のサイズ（px）
+      const double sigma = r * 0.6;          // エッジのやわらかさ
+      const double inv2sigma2 = 1.0 / (2.0 * sigma * sigma);
+      const double amp = static_cast<double>(hotK - bgK);
 
-      for (int y = 0; y < (int)h_; ++y) {
-        for (int x = 0; x < (int)w_; ++x) {
-          int dx = x - cx, dy = y - cy;
-          if (dx * dx + dy * dy <= r * r) {
-            f.pixels[(size_t)y * w_ + x] = hotK;
-          }
+      for (int y = 0; y < static_cast<int>(h_); ++y) {
+        for (int x = 0; x < static_cast<int>(w_); ++x) {
+          const double dx = static_cast<double>(x - cx);
+          const double dy = static_cast<double>(y - cy);
+          const double d2 = dx * dx + dy * dy;
+          const double w = std::exp(-d2 * inv2sigma2); // 0..1
+          const double val = static_cast<double>(bgK) + amp * w;
+          // Kelvin*100 の範囲に丸める
+          uint16_t k = static_cast<uint16_t>(std::lround(std::clamp(val, (double)0.0, (double)65535.0)));
+          f.pixels[(size_t)y * w_ + x] = k;
         }
       }
 
@@ -155,7 +193,7 @@ private:
 
 class PT3Source : public IFrameSource {
 public:
-  PT3Source(double fps = 9.0) : fps_(fps) {}
+  PT3Source(double fps = 9.0, bool fps_auto = false) : fps_(fps), fps_auto_(fps_auto) {}
 
   bool start() override {
     if (running_.exchange(true)) return true;
@@ -192,7 +230,34 @@ public:
     };
 
     bool ok = false;
-    const int rfps = static_cast<int>(fps_ > 0 ? std::lround(fps_) : 9);
+    int rfps = static_cast<int>(fps_ > 0 ? std::lround(fps_) : 9);
+
+    // fps_auto_ の場合、フレーム記述子から最大fpsを推定して試す
+    if (fps_auto_) {
+      double best_fps = 0.0;
+      int best_w = 0, best_h = 0;
+      const uvc_format_desc_t* fmt = uvc_get_format_descs(devh_);
+      for (const uvc_format_desc_t* f = fmt; f; f = f->next) {
+        for (const uvc_frame_desc_t* fd = f->frame_descs; fd; fd = fd->next) {
+          if (fd->wWidth <= 0 || fd->wHeight <= 0) continue;
+          if (fd->intervals) {
+            for (const uint32_t* p = fd->intervals; *p; ++p) {
+              const double fps_val = (*p > 0) ? (1e7 / static_cast<double>(*p)) : 0.0; // 100ns単位
+              if (fps_val > best_fps) {
+                best_fps = fps_val;
+                best_w = fd->wWidth;
+                best_h = fd->wHeight;
+              }
+            }
+          }
+        }
+      }
+      if (best_fps > 0.0) {
+        rfps = std::max(1, static_cast<int>(std::lround(best_fps)));
+        ok = try_any(best_w, best_h, rfps);
+      }
+    }
+
     if (!ok) ok = try_any(160, 120, rfps);
     if (!ok) ok = try_any(80, 60, rfps);
 
@@ -308,6 +373,7 @@ private:
   }
 
   double fps_;
+  bool fps_auto_{};
   std::atomic<bool> running_{false};
   std::mutex mu_;
   std::optional<Frame> latest_;
@@ -499,7 +565,8 @@ static std::shared_ptr<std::vector<uint8_t>> pack_frame(const Frame &f) {
 struct Args {
   std::string mode = "dummy"; // dummy | pt3
   uint16_t port = 8765;
-  double fps = 9.0;
+  double fps = 9.0;            // 固定fps（>0）
+  bool fps_auto = true;        // 既定でソース（デバイス上限）に追従
 };
 
 static Args parse_args(int argc, char **argv) {
@@ -522,10 +589,15 @@ static Args parse_args(int argc, char **argv) {
     } else if (s == "--fps") {
       std::string v;
       next(v);
-      a.fps = std::stod(v);
+      if (v == "auto" || v == "max") {
+        a.fps_auto = true;
+      } else {
+        a.fps = std::stod(v);
+        a.fps_auto = false; // 数値指定時は固定fps
+      }
     } else if (s == "--help" || s == "-h") {
       std::cout << "Usage: lepton_ws_server [--mode dummy|pt3] [--port 8765] "
-                   "[--fps 9]\n"
+                   "[--fps auto|NUM] (default: auto)\n"
                    "Binary frame protocol: 32-byte header + uint16 pixels "
                    "(little-endian)\n";
       std::exit(0);
@@ -533,6 +605,155 @@ static Args parse_args(int argc, char **argv) {
   }
   return a;
 }
+
+// --- Source monitor with auto-reconnect ---
+class SourceMonitor : public IFrameSource {
+public:
+  SourceMonitor(std::string mode, double fps, bool fps_auto)
+      : mode_(std::move(mode)), fps_(fps), fps_auto_(fps_auto) {}
+
+  bool start() override {
+    if (running_.exchange(true)) return true;
+    th_ = std::thread([this]{ loop(); });
+    return true; // 起動時にデバイスが無くても失敗にしない
+  }
+
+  void stop() override {
+    if (!running_.exchange(false)) return;
+    if (th_.joinable()) th_.join();
+    std::unique_ptr<IFrameSource> old;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      old = std::move(cur_);
+    }
+    if (old) old->stop();
+  }
+
+  std::optional<Frame> latest() override {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (cur_) return cur_->latest();
+    return std::nullopt;
+  }
+  uint16_t width() const override {
+    std::lock_guard<std::mutex> lk(mu_);
+    return last_w_;
+  }
+  uint16_t height() const override {
+    std::lock_guard<std::mutex> lk(mu_);
+    return last_h_;
+  }
+
+private:
+  std::unique_ptr<IFrameSource> make_source() {
+    if (mode_ == "dummy") {
+      return std::make_unique<DummySource>(160, 120, fps_);
+    } else if (mode_ == "pt3") {
+#ifdef USE_LIBUVC
+      return std::make_unique<PT3Source>(fps_, fps_auto_);
+#else
+      // ビルド時にUVCが無効なら何もしない
+      return nullptr;
+#endif
+    }
+    return nullptr;
+  }
+
+  void loop() {
+    using namespace std::chrono;
+    const auto retry_interval = seconds(2);
+    const auto stall_timeout = duration<double>(fps_auto_ ? 3.0 : std::max(2.5, 3.0 / std::max(1.0, fps_))); // おおよそ3フレーム
+    auto last_log_status = steady_clock::now();
+
+    uint32_t last_frame_id = UINT32_MAX;
+    auto last_frame_tp = steady_clock::now();
+
+    while (running_.load()) {
+      // 確実に現在のソースを保持
+      std::unique_ptr<IFrameSource> local;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (cur_) local.reset(cur_.release()); // 移動してロック外で利用
+      }
+
+      if (!local) {
+        // まだ接続されていない → 作成して接続試行
+        auto candidate = make_source();
+        if (!candidate) {
+          log(LogLevel::WARN, "No source available for mode='" + mode_ + "'. Retrying...");
+          std::this_thread::sleep_for(retry_interval);
+          continue;
+        }
+        log(LogLevel::INFO, "Probing device (mode=" + mode_ + ")...");
+        if (candidate->start()) {
+          log(LogLevel::INFO, "Device connected. Streaming started.");
+          // 共有へ戻す
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            cur_ = std::move(candidate);
+          }
+          last_frame_id = UINT32_MAX;
+          last_frame_tp = steady_clock::now();
+        } else {
+          log(LogLevel::WARN, "Device not available. Will retry.");
+          std::this_thread::sleep_for(retry_interval);
+        }
+      } else {
+        // 稼働中の監視
+        bool keep = true;
+        // フレームの進み具合を確認
+        auto opt = local->latest();
+        if (opt) {
+          // 更新
+          if (opt->hdr.frame_id != last_frame_id) {
+            last_frame_id = opt->hdr.frame_id;
+            last_frame_tp = steady_clock::now();
+            // 幅高さを記録
+            last_w_ = opt->hdr.width;
+            last_h_ = opt->hdr.height;
+          }
+        }
+
+        const auto now = steady_clock::now();
+        if (now - last_frame_tp > stall_timeout && mode_ != "dummy") {
+          log(LogLevel::WARN, "No frames received recently; restarting stream...");
+          keep = false;
+        }
+
+        if (!keep) {
+          local->stop();
+          // 破棄して再接続へ
+          log(LogLevel::INFO, "Device disconnected. Will try to reconnect.");
+          // ドロップ
+        } else {
+          // 状態ログ（5秒毎程度）
+          if (now - last_log_status > seconds(5)) {
+            const auto age_ms = duration_cast<milliseconds>(now - last_frame_tp).count();
+            log(LogLevel::INFO, "Streaming OK. last_frame_age_ms=" + std::to_string((long long)age_ms));
+            last_log_status = now;
+          }
+        }
+
+        // 共有スロットへ返す or 破棄
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          if (keep) cur_.reset(local.release()); // 返す
+          // keep==false の場合はlocalはこのスコープを抜けて破棄される
+        }
+
+        std::this_thread::sleep_for(milliseconds(100));
+      }
+    }
+  }
+
+  std::string mode_;
+  double fps_;
+  bool fps_auto_{};
+  std::atomic<bool> running_{false};
+  std::thread th_;
+  mutable std::mutex mu_;
+  std::unique_ptr<IFrameSource> cur_;
+  uint16_t last_w_{0}, last_h_{0};
+};
 
 int main(int argc, char **argv) {
   Args args;
@@ -544,25 +765,9 @@ int main(int argc, char **argv) {
   }
 
   std::unique_ptr<IFrameSource> src;
-
-  if (args.mode == "dummy") {
-    src = std::make_unique<DummySource>(160, 120, args.fps);
-  } else if (args.mode == "pt3") {
-#ifdef USE_LIBUVC
-    src = std::make_unique<PT3Source>(args.fps);
-#else
-    std::cerr << "pt3 mode requires -DUSE_LIBUVC=ON at build time.\n";
-    return 1;
-#endif
-  } else {
-    std::cerr << "Unknown mode: " << args.mode << "\n";
-    return 1;
-  }
-
-  if (!src->start()) {
-    std::cerr << "Failed to start source.\n";
-    return 1;
-  }
+  // 監視付きソース（初期未接続でも継続運転）
+  src = std::make_unique<SourceMonitor>(args.mode, args.fps, args.fps_auto);
+  (void)src->start();
 
   asio::io_context ioc{1};
   Hub hub;
@@ -573,28 +778,40 @@ int main(int argc, char **argv) {
 
   std::atomic<bool> running{true};
 
-  // broadcast loop: 最新フレームを一定周期で配信
+  // broadcast loop: 最新フレームを配信（固定fps or 自動）
   std::thread broadcaster([&] {
+    using namespace std::chrono;
     uint32_t last_id = UINT32_MAX;
-    const auto period = std::chrono::duration<double>(1.0 / args.fps);
-    auto next = std::chrono::steady_clock::now();
-
-    while (running.load()) {
-      next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-          period);
-
-      auto opt = src->latest();
-      if (opt && opt->hdr.frame_id != last_id) {
-        last_id = opt->hdr.frame_id;
-        hub.broadcast(pack_frame(*opt));
+    if (!args.fps_auto) {
+      const auto period = duration<double>(1.0 / args.fps);
+      auto next = steady_clock::now();
+      while (running.load()) {
+        next += duration_cast<steady_clock::duration>(period);
+        auto opt = src->latest();
+        if (opt && opt->hdr.frame_id != last_id) {
+          last_id = opt->hdr.frame_id;
+          hub.broadcast(pack_frame(*opt));
+        }
+        std::this_thread::sleep_until(next);
       }
-
-      std::this_thread::sleep_until(next);
+    } else {
+      // 自動: 新しいフレームが来たら即送る（短いポーリングでスピン回避）
+      const auto poll = 1ms;
+      while (running.load()) {
+        auto opt = src->latest();
+        if (opt && opt->hdr.frame_id != last_id) {
+          last_id = opt->hdr.frame_id;
+          hub.broadcast(pack_frame(*opt));
+        } else {
+          std::this_thread::sleep_for(poll);
+        }
+      }
     }
   });
 
-  std::cout << "WebSocket server on ws://127.0.0.1:" << args.port
-            << " mode=" << args.mode << " fps=" << args.fps << "\n";
+  log(LogLevel::INFO, std::string("WebSocket server on ws://127.0.0.1:") +
+                         std::to_string(args.port) + " mode=" + args.mode +
+                         (args.fps_auto ? " fps=auto" : (" fps=" + std::to_string(args.fps))));
 
   ioc.run();
 
