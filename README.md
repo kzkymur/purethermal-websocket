@@ -1,4 +1,4 @@
-# uvc-y16-websocket
+# purethermal-websocket
 
 A minimal WebSocket server that captures 16‑bit grayscale (Y16) frames from UVC devices (e.g., PureThermal + FLIR Lepton) via libuvc and streams them to clients.
 
