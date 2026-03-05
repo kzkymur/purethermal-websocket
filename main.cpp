@@ -205,8 +205,14 @@ public:
       return false;
     }
 
-    // Find the first UVC device (you can specialize with VID/PID later)
-    res = uvc_find_device(ctx_, &dev_, 0, 0, nullptr);
+    // Prefer PureThermal devices (GroupGets VID 0x1e4e), like GetThermal does.
+    // Try vendor filter first; fall back to any UVC if not found.
+    constexpr int kVidGroupGets = 0x1e4e;
+    res = uvc_find_device(ctx_, &dev_, kVidGroupGets, 0, nullptr);
+    if (res != UVC_SUCCESS) {
+      // fallback: first UVC
+      res = uvc_find_device(ctx_, &dev_, 0, 0, nullptr);
+    }
     if (res != UVC_SUCCESS) {
       std::cerr << "uvc_find_device failed: " << uvc_strerror(res) << "\n";
       cleanup();
@@ -220,12 +226,22 @@ public:
       return false;
     }
 
-    // Negotiate stream. Prefer 160x120 or 80x60. Fallback: enumerate sizes.
+    // Log the chosen device (helpful to verify we didn't bind to a webcam)
+    if (dev_) {
+      uvc_device_descriptor_t* desc = nullptr;
+      if (uvc_get_device_descriptor(dev_, &desc) == UVC_SUCCESS && desc) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "Opened device VID:PID = %04x:%04x", desc->idVendor, desc->idProduct);
+        log(LogLevel::INFO, buf);
+        uvc_free_device_descriptor(desc);
+      }
+    }
+
+    // Negotiate stream. Prefer Y16/GRAY16 at 160x120 or 80x60.
     uvc_stream_ctrl_t ctrl{};
 
-    auto try_any = [&](int w, int h, int fps) -> bool {
-      uvc_error_t r = uvc_get_stream_ctrl_format_size(
-          devh_, &ctrl, UVC_FRAME_FORMAT_ANY, w, h, fps);
+    auto try_fmt = [&](uvc_frame_format fmt, int w, int h, int fps) -> bool {
+      uvc_error_t r = uvc_get_stream_ctrl_format_size(devh_, &ctrl, fmt, w, h, fps);
       return r == UVC_SUCCESS;
     };
 
@@ -254,34 +270,48 @@ public:
       }
       if (best_fps > 0.0) {
         rfps = std::max(1, static_cast<int>(std::lround(best_fps)));
-        ok = try_any(best_w, best_h, rfps);
+        // Try Y16/GRAY16 first for thermal data
+        // Prefer Y16/GRAY16 for thermal
+#ifdef UVC_FRAME_FORMAT_Y16
+        if (!ok) ok = try_fmt(UVC_FRAME_FORMAT_Y16, best_w, best_h, rfps);
+#endif
+#ifdef UVC_FRAME_FORMAT_GRAY16
+        if (!ok) ok = try_fmt(UVC_FRAME_FORMAT_GRAY16, best_w, best_h, rfps);
+#endif
+        // Fallback to ANY if neither exists
+        if (!ok) ok = try_fmt(UVC_FRAME_FORMAT_ANY, best_w, best_h, rfps);
       }
     }
 
-    if (!ok) ok = try_any(160, 120, rfps);
-    if (!ok) ok = try_any(80, 60, rfps);
-
-#ifdef UVC_FRAME_FORMAT_GRAY16
-    if (!ok) {
-      // Some libuvc builds expose explicit GRAY16; try that too.
-      if (uvc_get_stream_ctrl_format_size(devh_, &ctrl, UVC_FRAME_FORMAT_GRAY16,
-                                          160, 120, rfps) == UVC_SUCCESS)
-        ok = true;
-      else if (uvc_get_stream_ctrl_format_size(devh_, &ctrl, UVC_FRAME_FORMAT_GRAY16,
-                                               80, 60, rfps) == UVC_SUCCESS)
-        ok = true;
-    }
+    // Fixed sizes preferred by Lepton/PureThermal
+    // Try preferred sizes
+#ifdef UVC_FRAME_FORMAT_Y16
+    if (!ok) ok = try_fmt(UVC_FRAME_FORMAT_Y16, 160, 120, rfps);
+    if (!ok) ok = try_fmt(UVC_FRAME_FORMAT_Y16, 80, 60, rfps);
 #endif
+#ifdef UVC_FRAME_FORMAT_GRAY16
+    if (!ok) ok = try_fmt(UVC_FRAME_FORMAT_GRAY16, 160, 120, rfps);
+    if (!ok) ok = try_fmt(UVC_FRAME_FORMAT_GRAY16, 80, 60, rfps);
+#endif
+    if (!ok) ok = try_fmt(UVC_FRAME_FORMAT_ANY, 160, 120, rfps);
+    if (!ok) ok = try_fmt(UVC_FRAME_FORMAT_ANY, 80, 60, rfps);
 
     if (!ok) {
-      // Enumerate advertised frame sizes and pick the first that works.
+      // Enumerate advertised frame sizes and pick the first Y16/GRAY16 that works.
       const uvc_format_desc_t* fmt = uvc_get_format_descs(devh_);
       for (const uvc_format_desc_t* f = fmt; f && !ok; f = f->next) {
         for (const uvc_frame_desc_t* fd = f->frame_descs; fd && !ok; fd = fd->next) {
           int w = fd->wWidth;
           int h = fd->wHeight;
           if (w <= 0 || h <= 0) continue;
-          if (try_any(w, h, rfps)) ok = true;
+          // Try Y16 then GRAY16; avoid ANY to prevent mismatched formats
+#ifdef UVC_FRAME_FORMAT_Y16
+          if (!ok && try_fmt(UVC_FRAME_FORMAT_Y16, w, h, rfps)) ok = true;
+#endif
+#ifdef UVC_FRAME_FORMAT_GRAY16
+          if (!ok && try_fmt(UVC_FRAME_FORMAT_GRAY16, w, h, rfps)) ok = true;
+#endif
+          if (!ok && try_fmt(UVC_FRAME_FORMAT_ANY, w, h, rfps)) ok = true;
         }
       }
     }
@@ -292,6 +322,9 @@ public:
       cleanup();
       return false;
     }
+
+    // Optional: status callback (disconnect/streamoff notifications)
+    uvc_set_status_callback(devh_, &PT3Source::on_status_static, this);
 
     // Start streaming; callback will fill latest_.
     res = uvc_start_streaming(devh_, &ctrl, &PT3Source::on_frame_static, this, 0);
@@ -324,6 +357,11 @@ private:
   static void on_frame_static(uvc_frame_t* frame, void* user) {
     static_cast<PT3Source*>(user)->on_frame(frame);
   }
+  static void on_status_static(uvc_status_class status_class, int event, int selector,
+                               uvc_status_attribute status_attribute, void* data, size_t data_len,
+                               void* user) {
+    static_cast<PT3Source*>(user)->on_status(status_class, event, selector, status_attribute, data, data_len);
+  }
 
   void on_frame(uvc_frame_t* frame) {
     if (!frame || frame->data_bytes == 0) return;
@@ -353,8 +391,19 @@ private:
 
     {
       std::lock_guard<std::mutex> lk(mu_);
+      negotiated_w_ = w;
+      negotiated_h_ = h;
       latest_ = std::move(f);
     }
+  }
+
+  void on_status(uvc_status_class status_class, int event, int selector,
+                 uvc_status_attribute attr, void*, size_t) {
+    // Log notable events to aid diagnosis; SourceMonitor handles reconnect.
+    // Common cases: UVC_STATUS_CLASS_CONTROL with STREAMING_INTERFACE status.
+    (void)selector; (void)attr;
+    log(LogLevel::WARN, std::string("UVC status event class=") + std::to_string((int)status_class) +
+                         " event=" + std::to_string(event));
   }
 
   void cleanup() {
@@ -660,12 +709,23 @@ private:
 
   void loop() {
     using namespace std::chrono;
-    const auto retry_interval = seconds(2);
-    const auto stall_timeout = duration<double>(fps_auto_ ? 3.0 : std::max(2.5, 3.0 / std::max(1.0, fps_))); // おおよそ3フレーム
+    // ベースのリトライ間隔と最大バックオフ
+    const auto retry_interval_base = milliseconds(800);
+    const auto retry_interval_max  = seconds(8);
+
+    // ストール検出しきい値（fps_auto 時はやや長め）
+    const auto stall_timeout = duration<double>(
+        fps_auto_ ? 4.0 : std::max(3.0, 3.0 / std::max(1.0, fps_))
+    ); // おおよそ3フレーム + マージン
     auto last_log_status = steady_clock::now();
 
     uint32_t last_frame_id = UINT32_MAX;
     auto last_frame_tp = steady_clock::now();
+
+    // 連続失敗でバックオフを伸ばす
+    int consecutive_failures = 0;
+    // 連続でストール判定した回数（ノイズ抑制用）
+    int consecutive_stalls = 0;
 
     while (running_.load()) {
       // 確実に現在のソースを保持
@@ -680,22 +740,60 @@ private:
         auto candidate = make_source();
         if (!candidate) {
           log(LogLevel::WARN, "No source available for mode='" + mode_ + "'. Retrying...");
-          std::this_thread::sleep_for(retry_interval);
+          // バックオフ
+          {
+            const int exp = 1 << std::min(consecutive_failures, 4);
+            auto backoff_ms = std::min(duration_cast<milliseconds>(retry_interval_max),
+                                       retry_interval_base * exp);
+            std::this_thread::sleep_for(backoff_ms);
+          }
           continue;
         }
         log(LogLevel::INFO, "Probing device (mode=" + mode_ + ")...");
         if (candidate->start()) {
+          // 接続直後にフレームが流れてくるかを短時間確認（ウォームアップ）
+          const auto warmup_deadline = steady_clock::now() + seconds(2);
+          uint32_t warmup_last_id = UINT32_MAX;
+          bool warmup_ok = false;
+          while (steady_clock::now() < warmup_deadline) {
+            auto opt = candidate->latest();
+            if (opt) {
+              if (warmup_last_id == UINT32_MAX) warmup_last_id = opt->hdr.frame_id;
+              if (opt->hdr.frame_id != warmup_last_id) { warmup_ok = true; break; }
+            }
+            std::this_thread::sleep_for(milliseconds(50));
+          }
+
+          if (!warmup_ok && mode_ != "dummy") {
+            log(LogLevel::WARN, "No frames during warmup; closing and retrying.");
+            candidate->stop();
+            consecutive_failures = std::min(consecutive_failures + 1, 16);
+            const int exp = 1 << std::min(consecutive_failures, 4);
+            auto backoff_ms = std::min(duration_cast<milliseconds>(retry_interval_max),
+                                       retry_interval_base * exp);
+            std::this_thread::sleep_for(backoff_ms);
+            continue; // 再試行
+          }
+
+          // ウォームアップ通過 → 採用
           log(LogLevel::INFO, "Device connected. Streaming started.");
-          // 共有へ戻す
           {
             std::lock_guard<std::mutex> lk(mu_);
             cur_ = std::move(candidate);
           }
           last_frame_id = UINT32_MAX;
           last_frame_tp = steady_clock::now();
+          consecutive_failures = 0;
+          consecutive_stalls = 0;
         } else {
           log(LogLevel::WARN, "Device not available. Will retry.");
-          std::this_thread::sleep_for(retry_interval);
+          consecutive_failures = std::min(consecutive_failures + 1, 16);
+          {
+            const int exp = 1 << std::min(consecutive_failures, 4);
+            auto backoff_ms = std::min(duration_cast<milliseconds>(retry_interval_max),
+                                       retry_interval_base * exp);
+            std::this_thread::sleep_for(backoff_ms);
+          }
         }
       } else {
         // 稼働中の監視
@@ -710,19 +808,39 @@ private:
             // 幅高さを記録
             last_w_ = opt->hdr.width;
             last_h_ = opt->hdr.height;
+            consecutive_stalls = 0; // 新規フレームでリセット
           }
         }
 
         const auto now = steady_clock::now();
         if (now - last_frame_tp > stall_timeout && mode_ != "dummy") {
-          log(LogLevel::WARN, "No frames received recently; restarting stream...");
-          keep = false;
+          // 一度の閾値越えでは切断せず、連続で検知したら再起動
+          ++consecutive_stalls;
+          if (consecutive_stalls >= 2) { // 少なくとも2回連続でストール
+            log(LogLevel::WARN, "No frames received recently; restarting stream...");
+            keep = false;
+          }
+        } else {
+          // 回復したらカウンタを戻す
+          consecutive_stalls = 0;
         }
 
         if (!keep) {
           local->stop();
           // 破棄して再接続へ
           log(LogLevel::INFO, "Device disconnected. Will try to reconnect.");
+          consecutive_failures = std::min(consecutive_failures + 1, 16);
+          // 共有スロットを空にしてバックオフ後に再試行
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            // drop
+          }
+          {
+            const int exp = 1 << std::min(consecutive_failures, 4);
+            auto backoff_ms = std::min(duration_cast<milliseconds>(retry_interval_max),
+                                       retry_interval_base * exp);
+            std::this_thread::sleep_for(backoff_ms);
+          }
           // ドロップ
         } else {
           // 状態ログ（5秒毎程度）
