@@ -36,6 +36,8 @@ sudo ./lepton_ws_server --mode pt3
 - `--port <num>` (default: `8765`)
 - `--fps auto|NUM` (default: `auto`)
 - `--scale NUM` (default: `100`, `Kelvin = value / scale`)
+- `--assume-tlinear` (default: ON, `format=1` / `scale=--scale`)
+- `--no-assume-tlinear` (`format=0` / `scale=0` で配信)
 
 ## Client Decode Example (Python)
 

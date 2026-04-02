@@ -362,7 +362,7 @@ static std::string fourcc_to_string(const uint8_t fourcc[4]) {
 class PT3Source : public IFrameSource {
 public:
   PT3Source(double fps = 9.0, bool fps_auto = false,
-            bool assume_tlinear = false, uint16_t scale = kDefaultScaleKelvin)
+            bool assume_tlinear = true, uint16_t scale = kDefaultScaleKelvin)
       : fps_(fps), fps_auto_(fps_auto), assume_tlinear_(assume_tlinear),
         scale_(scale) {}
 
@@ -1009,7 +1009,7 @@ struct Args {
   double fps = 9.0;
   bool fps_auto = true;
   uint16_t scale = kDefaultScaleKelvin;
-  bool assume_tlinear = false; // 明示指定時のみ true
+  bool assume_tlinear = true;
 };
 
 static Args parse_args(int argc, char **argv) {
@@ -1053,13 +1053,16 @@ static Args parse_args(int argc, char **argv) {
       a.scale = static_cast<uint16_t>(parsed);
     } else if (s == "--assume-tlinear") {
       a.assume_tlinear = true;
+    } else if (s == "--no-assume-tlinear") {
+      a.assume_tlinear = false;
     } else if (s == "--help" || s == "-h") {
       std::cout
           << "Usage: lepton_ws_server [--mode dummy|pt3] [--port 8765] "
-             "[--fps auto|NUM] [--scale NUM] [--assume-tlinear]\n"
+             "[--fps auto|NUM] [--scale NUM] [--assume-tlinear|--no-assume-tlinear]\n"
              "Protocol: 32-byte header + uint16 pixels (little-endian)\n"
              "Header.format: 0=RAW_UNKNOWN, 1=UINT16_TLINEAR_KELVIN\n"
-             "--assume-tlinear を付けた場合のみ format=1 として配信します。\n";
+             "デフォルトは format=1/scale=--scale。RAWとして配信したい場合のみ\n"
+             "--no-assume-tlinear を指定してください。\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unknown option: " + s);
