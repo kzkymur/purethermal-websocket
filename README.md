@@ -6,20 +6,26 @@ Wire format: a fixed 32‑byte header followed by pixel data as little‑endian 
 
 Networking is implemented with Boost.Asio/Beast. Use `--mode pt3` for real hardware (libuvc) and `--mode dummy` for the synthetic frames.
 
+## Demo
+
+![Demo with webcv-platform](demo_with_webcv-platform.gif)
+
+The demo client shown above is [webcv-platform](https://github.com/kzkymur/webcv-platform).
+
 ## Build
 
 ```sh
 cmake . & make
 ```
 
-Lepton SDKによるFFC制御は常時有効です。  
-`external/GetThermal/lepton_sdk` を submodule として取得して利用します。
+Lepton SDK based FFC control is always enabled.  
+The SDK is consumed from the submodule at `external/GetThermal/lepton_sdk`.
 
 ```sh
-# 初回のみ（このリポジトリに submodule を追加する場合）
+# first time only (if you are adding the submodule in this repository)
 git submodule add https://github.com/groupgets/GetThermal.git external/GetThermal
 
-# clone 後 / 更新時
+# after clone / on update
 git submodule update --init --recursive
 
 # build
@@ -52,15 +58,15 @@ sudo ./lepton_ws_server --mode pt3
 - `--fps auto|NUM` (default: `auto`)
 - `--scale NUM` (default: `100`, `Kelvin = value / scale`)
 - `--assume-tlinear` (default: ON, `format=1` / `scale=--scale`)
-- `--no-assume-tlinear` (`format=0` / `scale=0` で配信)
+- `--no-assume-tlinear` (stream with `format=0` / `scale=0`)
 - `--ffc-mode manual|auto|external` (default: `manual`)
 
 ## FFC Control
 
-- WebSocket クライアントから `ffc`（テキスト）を送ると FFC 要求を受け付けます。
-- バイナリ `0x01` 1バイトでも同じく FFC 要求になります。
-- 実行は `--mode pt3` で有効です。
-- シャッターモードは `--ffc-mode` で実行時に選択できます（起動時と `ffc` 要求時に適用）。
+- Send `ffc` (text) from a WebSocket client to request FFC.
+- Sending a single-byte binary payload `0x01` triggers the same FFC request.
+- FFC control is active in `--mode pt3`.
+- Shutter mode is selected at runtime with `--ffc-mode` (applied at startup and on each `ffc` request).
 
 ### Send `ffc` from a client (Python)
 
