@@ -12,6 +12,21 @@ Networking is implemented with Boost.Asio/Beast. Use `--mode pt3` for real hardw
 cmake . & make
 ```
 
+Lepton SDKによるFFC制御は常時有効です。  
+`external/GetThermal/lepton_sdk` を submodule として取得して利用します。
+
+```sh
+# 初回のみ（このリポジトリに submodule を追加する場合）
+git submodule add https://github.com/groupgets/GetThermal.git external/GetThermal
+
+# clone 後 / 更新時
+git submodule update --init --recursive
+
+# build
+cmake -S . -B build
+cmake --build build -j
+```
+
 ## Run
 
 ```sh
@@ -38,6 +53,24 @@ sudo ./lepton_ws_server --mode pt3
 - `--scale NUM` (default: `100`, `Kelvin = value / scale`)
 - `--assume-tlinear` (default: ON, `format=1` / `scale=--scale`)
 - `--no-assume-tlinear` (`format=0` / `scale=0` で配信)
+- `--ffc-mode manual|auto|external` (default: `manual`)
+
+## FFC Control
+
+- WebSocket クライアントから `ffc`（テキスト）を送ると FFC 要求を受け付けます。
+- バイナリ `0x01` 1バイトでも同じく FFC 要求になります。
+- 実行は `--mode pt3` で有効です。
+- シャッターモードは `--ffc-mode` で実行時に選択できます（起動時と `ffc` 要求時に適用）。
+
+### Send `ffc` from a client (Python)
+
+```sh
+python scripts/send_ffc.py
+# or
+./scripts/send_ffc.py
+# optional: binary trigger
+python scripts/send_ffc.py --binary
+```
 
 ## Client Decode Example (Python)
 

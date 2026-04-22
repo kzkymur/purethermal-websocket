@@ -129,6 +129,54 @@ lepton_ws_server/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/lepton_ws_server.dir/build.make CMakeFiles/lepton_ws_server.dir/build
 .PHONY : lepton_ws_server/fast
 
+external/GetThermal/lepton_sdk/Src/LEPTON_SDK.o: external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.o
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SDK.o
+
+# target to build an object file
+external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/lepton_ws_server.dir/build.make CMakeFiles/lepton_ws_server.dir/external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.o
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.o
+
+external/GetThermal/lepton_sdk/Src/LEPTON_SDK.i: external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.i
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SDK.i
+
+# target to preprocess a source file
+external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/lepton_ws_server.dir/build.make CMakeFiles/lepton_ws_server.dir/external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.i
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.i
+
+external/GetThermal/lepton_sdk/Src/LEPTON_SDK.s: external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.s
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SDK.s
+
+# target to generate assembly for a file
+external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/lepton_ws_server.dir/build.make CMakeFiles/lepton_ws_server.dir/external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.s
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SDK.c.s
+
+external/GetThermal/lepton_sdk/Src/LEPTON_SYS.o: external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.o
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SYS.o
+
+# target to build an object file
+external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/lepton_ws_server.dir/build.make CMakeFiles/lepton_ws_server.dir/external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.o
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.o
+
+external/GetThermal/lepton_sdk/Src/LEPTON_SYS.i: external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.i
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SYS.i
+
+# target to preprocess a source file
+external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/lepton_ws_server.dir/build.make CMakeFiles/lepton_ws_server.dir/external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.i
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.i
+
+external/GetThermal/lepton_sdk/Src/LEPTON_SYS.s: external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.s
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SYS.s
+
+# target to generate assembly for a file
+external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/lepton_ws_server.dir/build.make CMakeFiles/lepton_ws_server.dir/external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.s
+.PHONY : external/GetThermal/lepton_sdk/Src/LEPTON_SYS.c.s
+
 main.o: main.cpp.o
 .PHONY : main.o
 
@@ -162,6 +210,12 @@ help:
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
 	@echo "... lepton_ws_server"
+	@echo "... external/GetThermal/lepton_sdk/Src/LEPTON_SDK.o"
+	@echo "... external/GetThermal/lepton_sdk/Src/LEPTON_SDK.i"
+	@echo "... external/GetThermal/lepton_sdk/Src/LEPTON_SDK.s"
+	@echo "... external/GetThermal/lepton_sdk/Src/LEPTON_SYS.o"
+	@echo "... external/GetThermal/lepton_sdk/Src/LEPTON_SYS.i"
+	@echo "... external/GetThermal/lepton_sdk/Src/LEPTON_SYS.s"
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(lepton_ws_server CXX)
+project(lepton_ws_server C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,3 +50,17 @@ if(NOT LIBUVC_FOUND)
 endif()
 
 target_compile_definitions(lepton_ws_server PRIVATE USE_LIBUVC=1)
+
+set(LEPTON_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/GetThermal/lepton_sdk")
+if(NOT EXISTS "${LEPTON_SDK_ROOT}/Inc/LEPTON_SDK.h")
+  message(FATAL_ERROR
+    "Lepton SDK not found at ${LEPTON_SDK_ROOT}. Run: git submodule update --init --recursive")
+endif()
+target_include_directories(lepton_ws_server PRIVATE "${LEPTON_SDK_ROOT}/Inc")
+target_sources(lepton_ws_server PRIVATE
+  "${LEPTON_SDK_ROOT}/Src/LEPTON_SDK.c"
+  "${LEPTON_SDK_ROOT}/Src/LEPTON_SYS.c"
+)
+set_source_files_properties("${LEPTON_SDK_ROOT}/Src/LEPTON_SDK.c" PROPERTIES
+  COMPILE_FLAGS "-include uvc_sdk.h"
+)

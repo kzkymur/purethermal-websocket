@@ -1,0 +1,3 @@
+[submodule "external/GetThermal"]
+	path = external/GetThermal
+	url = https://github.com/groupgets/GetThermal.git

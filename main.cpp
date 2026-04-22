@@ -1,6 +1,7 @@
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/core/flat_buffer.hpp>
+#include <boost/beast/core/buffers_to_string.hpp>
 #include <boost/beast/websocket.hpp>
 
 #include <algorithm>
@@ -122,6 +123,21 @@ static void log(LogLevel lv, const std::string &msg) {
 
 static std::string yesno(bool v) { return v ? "yes" : "no"; }
 
+static std::string trim_ascii(std::string s) {
+  const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+  const auto b = std::find_if(s.begin(), s.end(), not_space);
+  if (b == s.end())
+    return "";
+  const auto e = std::find_if(s.rbegin(), s.rend(), not_space).base();
+  return std::string(b, e);
+}
+
+static std::string ascii_lower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return s;
+}
+
 static bool is_expected_lepton_size(uint16_t w, uint16_t h) {
   return (w == 160 && h == 120) || (w == 80 && h == 60);
 }
@@ -175,6 +191,7 @@ public:
   virtual std::optional<Frame> latest() = 0;
   virtual uint16_t width() const = 0;
   virtual uint16_t height() const = 0;
+  virtual bool request_ffc() { return false; }
 };
 
 // ===== Dummy source =====
@@ -273,6 +290,122 @@ private:
 
 #ifdef USE_LIBUVC
 #include <libuvc/libuvc.h>
+#include <LEPTON_SDK.h>
+#include <LEPTON_SYS.h>
+
+struct LeptonUvcPortContext {
+  uvc_device_handle_t *devh{nullptr};
+};
+
+static int lepton_command_id_to_unit_id(LEP_COMMAND_ID command_id) {
+  constexpr LEP_COMMAND_ID kCidAgcModule = 0x0100;
+  constexpr LEP_COMMAND_ID kCidOemModule = 0x0800;
+  constexpr LEP_COMMAND_ID kCidRadModule = 0x0E00;
+  constexpr LEP_COMMAND_ID kCidSysModule = 0x0200;
+  constexpr LEP_COMMAND_ID kCidVidModule = 0x0300;
+
+  constexpr int kXuLepAgcId = 3;
+  constexpr int kXuLepOemId = 4;
+  constexpr int kXuLepRadId = 5;
+  constexpr int kXuLepSysId = 6;
+  constexpr int kXuLepVidId = 7;
+
+  switch (command_id & 0x3f00) { // Ignore upper command-type bits.
+  case kCidAgcModule:
+    return kXuLepAgcId;
+  case kCidOemModule:
+    return kXuLepOemId;
+  case kCidRadModule:
+    return kXuLepRadId;
+  case kCidSysModule:
+    return kXuLepSysId;
+  case kCidVidModule:
+    return kXuLepVidId;
+  default:
+    return static_cast<int>(LEP_RANGE_ERROR);
+  }
+}
+
+extern "C" LEP_RESULT UVC_GetAttribute(LEP_CAMERA_PORT_DESC_T_PTR portDescPtr,
+                                       LEP_COMMAND_ID commandID,
+                                       LEP_ATTRIBUTE_T_PTR attributePtr,
+                                       LEP_UINT16 attributeWordLength) {
+  if (!portDescPtr || !portDescPtr->userPtr || !attributePtr) {
+    return LEP_COMM_PORT_NOT_OPEN;
+  }
+
+  auto *ctx = static_cast<LeptonUvcPortContext *>(portDescPtr->userPtr);
+  if (!ctx->devh) {
+    return LEP_COMM_PORT_NOT_OPEN;
+  }
+
+  const int unit_id = lepton_command_id_to_unit_id(commandID);
+  if (unit_id < 0) {
+    return static_cast<LEP_RESULT>(unit_id);
+  }
+
+  const int control_id = ((commandID & 0x00ff) >> 2) + 1;
+  const int payload_bytes = static_cast<int>(attributeWordLength) * 2;
+  const int result = uvc_get_ctrl(ctx->devh, unit_id, control_id, attributePtr,
+                                  payload_bytes, UVC_GET_CUR);
+  if (result != payload_bytes) {
+    return LEP_COMM_ERROR_READING_COMM;
+  }
+  return LEP_OK;
+}
+
+extern "C" LEP_RESULT UVC_SetAttribute(LEP_CAMERA_PORT_DESC_T_PTR portDescPtr,
+                                       LEP_COMMAND_ID commandID,
+                                       LEP_ATTRIBUTE_T_PTR attributePtr,
+                                       LEP_UINT16 attributeWordLength) {
+  if (!portDescPtr || !portDescPtr->userPtr || !attributePtr) {
+    return LEP_COMM_PORT_NOT_OPEN;
+  }
+
+  auto *ctx = static_cast<LeptonUvcPortContext *>(portDescPtr->userPtr);
+  if (!ctx->devh) {
+    return LEP_COMM_PORT_NOT_OPEN;
+  }
+
+  const int unit_id = lepton_command_id_to_unit_id(commandID);
+  if (unit_id < 0) {
+    return static_cast<LEP_RESULT>(unit_id);
+  }
+
+  const int control_id = ((commandID & 0x00ff) >> 2) + 1;
+  const int payload_bytes = static_cast<int>(attributeWordLength) * 2;
+  const int result =
+      uvc_set_ctrl(ctx->devh, unit_id, control_id, attributePtr, payload_bytes);
+  if (result != payload_bytes) {
+    return LEP_COMM_ERROR_WRITING_COMM;
+  }
+  return LEP_OK;
+}
+
+extern "C" LEP_RESULT UVC_RunCommand(LEP_CAMERA_PORT_DESC_T_PTR portDescPtr,
+                                     LEP_COMMAND_ID commandID) {
+  if (!portDescPtr || !portDescPtr->userPtr) {
+    return LEP_COMM_PORT_NOT_OPEN;
+  }
+
+  auto *ctx = static_cast<LeptonUvcPortContext *>(portDescPtr->userPtr);
+  if (!ctx->devh) {
+    return LEP_COMM_PORT_NOT_OPEN;
+  }
+
+  const int unit_id = lepton_command_id_to_unit_id(commandID);
+  if (unit_id < 0) {
+    return static_cast<LEP_RESULT>(unit_id);
+  }
+
+  const int control_id = ((commandID & 0x00ff) >> 2) + 1;
+  uint8_t run_arg = static_cast<uint8_t>(control_id);
+  const int result = uvc_set_ctrl(ctx->devh, unit_id, control_id, &run_arg, 1);
+  if (result != 1) {
+    return LEP_COMM_ERROR_WRITING_COMM;
+  }
+  return LEP_OK;
+}
 
 // libuvc の frame_format をログに出すための簡易変換
 static const char *uvc_format_name(uvc_frame_format fmt) {
@@ -362,9 +495,10 @@ static std::string fourcc_to_string(const uint8_t fourcc[4]) {
 class PT3Source : public IFrameSource {
 public:
   PT3Source(double fps = 9.0, bool fps_auto = false,
-            bool assume_tlinear = true, uint16_t scale = kDefaultScaleKelvin)
+            bool assume_tlinear = true, uint16_t scale = kDefaultScaleKelvin,
+            std::string ffc_mode = "manual")
       : fps_(fps), fps_auto_(fps_auto), assume_tlinear_(assume_tlinear),
-        scale_(scale) {}
+        scale_(scale), desired_ffc_mode_(std::move(ffc_mode)) {}
 
   bool start() override {
     if (running_.exchange(true))
@@ -666,6 +800,14 @@ public:
       return false;
     }
 
+    {
+      std::lock_guard<std::mutex> lk(ffc_mu_);
+      if (!ensure_ffc_mode_locked("startup")) {
+        log(LogLevel::WARN,
+            "Failed to apply configured FFC shutter mode at startup.");
+      }
+    }
+
     return true;
   }
 
@@ -684,6 +826,21 @@ public:
 
   uint16_t width() const override { return negotiated_w_; }
   uint16_t height() const override { return negotiated_h_; }
+  bool request_ffc() override {
+    std::lock_guard<std::mutex> lk(ffc_mu_);
+    if (!ensure_ffc_mode_locked("request")) {
+      return false;
+    }
+    LEP_RESULT res = LEP_RunSysFFCNormalization(&lep_port_);
+    if (res != LEP_OK) {
+      log(LogLevel::ERROR,
+          "LEP_RunSysFFCNormalization failed: code=" + std::to_string(res));
+      return false;
+    }
+
+    log(LogLevel::INFO, "FFC normalization requested.");
+    return true;
+  }
 
 private:
   static void on_frame_static(uvc_frame_t *frame, void *user) {
@@ -802,12 +959,16 @@ private:
       uvc_exit(ctx_);
       ctx_ = nullptr;
     }
+    std::lock_guard<std::mutex> lk(ffc_mu_);
+    lep_ctx_.devh = nullptr;
+    lep_port_ = LEP_CAMERA_PORT_DESC_T{};
   }
 
   double fps_;
   bool fps_auto_;
   bool assume_tlinear_;
   uint16_t scale_;
+  std::string desired_ffc_mode_;
 
   std::atomic<bool> running_{false};
   std::mutex mu_;
@@ -821,6 +982,86 @@ private:
   uint16_t negotiated_h_{120};
   uint32_t frame_id_{0};
   bool telemetry_strip_logged_{false};
+  static const char *ffc_mode_name(LEP_SYS_FFC_SHUTTER_MODE_E mode) {
+    switch (mode) {
+    case LEP_SYS_FFC_SHUTTER_MODE_MANUAL:
+      return "MANUAL";
+    case LEP_SYS_FFC_SHUTTER_MODE_AUTO:
+      return "AUTO";
+    case LEP_SYS_FFC_SHUTTER_MODE_EXTERNAL:
+      return "EXTERNAL";
+    default:
+      return "UNKNOWN";
+    }
+  }
+
+  LEP_SYS_FFC_SHUTTER_MODE_E desired_ffc_mode_enum() const {
+    if (desired_ffc_mode_ == "auto")
+      return LEP_SYS_FFC_SHUTTER_MODE_AUTO;
+    if (desired_ffc_mode_ == "external")
+      return LEP_SYS_FFC_SHUTTER_MODE_EXTERNAL;
+    return LEP_SYS_FFC_SHUTTER_MODE_MANUAL;
+  }
+
+  bool ensure_ffc_mode_locked(const char *context) {
+    if (!devh_) {
+      log(LogLevel::WARN, std::string("FFC ") + context +
+                              " rejected: UVC handle is unavailable.");
+      return false;
+    }
+
+    lep_ctx_.devh = devh_;
+    lep_port_.portID = 1;
+    lep_port_.portType = LEP_CCI_UVC;
+    lep_port_.userPtr = &lep_ctx_;
+
+    LEP_SYS_FFC_SHUTTER_MODE_OBJ_T obj{};
+    LEP_RESULT res = LEP_GetSysFfcShutterModeObj(&lep_port_, &obj);
+    if (res != LEP_OK) {
+      log(LogLevel::ERROR,
+          std::string("LEP_GetSysFfcShutterModeObj failed (") + context +
+              "): code=" + std::to_string(res));
+      return false;
+    }
+
+    const auto desired_mode = desired_ffc_mode_enum();
+    if (obj.shutterMode != desired_mode) {
+      const auto prev = obj.shutterMode;
+      obj.shutterMode = desired_mode;
+      res = LEP_SetSysFfcShutterModeObj(&lep_port_, obj);
+      if (res != LEP_OK) {
+        log(LogLevel::ERROR,
+            std::string("LEP_SetSysFfcShutterModeObj failed (") + context +
+                "): code=" + std::to_string(res));
+        return false;
+      }
+      log(LogLevel::INFO, std::string("FFC shutter mode changed ") +
+                              ffc_mode_name(prev) + " -> " +
+                              ffc_mode_name(desired_mode) + " (" + context +
+                              ")");
+    }
+
+    LEP_SYS_FFC_SHUTTER_MODE_OBJ_T verify{};
+    res = LEP_GetSysFfcShutterModeObj(&lep_port_, &verify);
+    if (res != LEP_OK) {
+      log(LogLevel::ERROR,
+          std::string("LEP_GetSysFfcShutterModeObj verify failed (") + context +
+              "): code=" + std::to_string(res));
+      return false;
+    }
+    if (verify.shutterMode != desired_mode) {
+      log(LogLevel::ERROR, std::string("FFC shutter mode is still ") +
+                               ffc_mode_name(verify.shutterMode) +
+                               " after set to " + ffc_mode_name(desired_mode) +
+                               " (" + context + ").");
+      return false;
+    }
+    return true;
+  }
+
+  std::mutex ffc_mu_;
+  LeptonUvcPortContext lep_ctx_{};
+  LEP_CAMERA_PORT_DESC_T lep_port_{};
 };
 #endif
 
@@ -852,6 +1093,10 @@ private:
 
 class Hub {
 public:
+  using FfcHandler = std::function<bool()>;
+  explicit Hub(FfcHandler on_ffc_request)
+      : on_ffc_request_(std::move(on_ffc_request)) {}
+
   void join(std::shared_ptr<Session> s) {
     std::lock_guard<std::mutex> lk(mu_);
     sessions_.insert(std::move(s));
@@ -869,9 +1114,16 @@ public:
     }
   }
 
+  bool request_ffc() const {
+    if (!on_ffc_request_)
+      return false;
+    return on_ffc_request_();
+  }
+
 private:
   std::mutex mu_;
   std::unordered_set<std::shared_ptr<Session>> sessions_;
+  FfcHandler on_ffc_request_;
 };
 
 void Session::start() {
@@ -901,6 +1153,24 @@ void Session::on_read(beast::error_code ec, std::size_t) {
     hub_.leave(shared_from_this());
     return;
   }
+
+  const std::string payload = beast::buffers_to_string(rbuf_.data());
+  bool is_ffc = false;
+  if (!ws_.got_text()) {
+    is_ffc = (payload.size() == 1 &&
+              static_cast<unsigned char>(payload[0]) == 0x01u);
+  } else {
+    const std::string cmd = ascii_lower(trim_ascii(payload));
+    is_ffc = (cmd == "ffc");
+  }
+
+  if (is_ffc) {
+    const bool accepted = hub_.request_ffc();
+    if (!accepted) {
+      log(LogLevel::WARN, "FFC request rejected.");
+    }
+  }
+
   rbuf_.consume(rbuf_.size());
   do_read();
 }
@@ -1010,6 +1280,7 @@ struct Args {
   bool fps_auto = true;
   uint16_t scale = kDefaultScaleKelvin;
   bool assume_tlinear = true;
+  std::string ffc_mode = "manual"; // manual | auto | external
 };
 
 static Args parse_args(int argc, char **argv) {
@@ -1055,10 +1326,18 @@ static Args parse_args(int argc, char **argv) {
       a.assume_tlinear = true;
     } else if (s == "--no-assume-tlinear") {
       a.assume_tlinear = false;
+    } else if (s == "--ffc-mode") {
+      std::string v;
+      next(v);
+      v = ascii_lower(trim_ascii(v));
+      if (v != "manual" && v != "auto" && v != "external")
+        throw std::runtime_error("--ffc-mode must be manual|auto|external");
+      a.ffc_mode = v;
     } else if (s == "--help" || s == "-h") {
       std::cout
           << "Usage: lepton_ws_server [--mode dummy|pt3] [--port 8765] "
-             "[--fps auto|NUM] [--scale NUM] [--assume-tlinear|--no-assume-tlinear]\n"
+             "[--fps auto|NUM] [--scale NUM] [--assume-tlinear|--no-assume-tlinear] "
+             "[--ffc-mode manual|auto|external]\n"
              "Protocol: 32-byte header + uint16 pixels (little-endian)\n"
              "Header.format: 0=RAW_UNKNOWN, 1=UINT16_TLINEAR_KELVIN\n"
              "デフォルトは format=1/scale=--scale。RAWとして配信したい場合のみ\n"
@@ -1077,9 +1356,10 @@ static Args parse_args(int argc, char **argv) {
 class SourceMonitor : public IFrameSource {
 public:
   SourceMonitor(std::string mode, double fps, bool fps_auto,
-                bool assume_tlinear, uint16_t scale)
+                bool assume_tlinear, uint16_t scale, std::string ffc_mode)
       : mode_(std::move(mode)), fps_(fps), fps_auto_(fps_auto),
-        assume_tlinear_(assume_tlinear), scale_(scale) {}
+        assume_tlinear_(assume_tlinear), scale_(scale),
+        ffc_mode_(std::move(ffc_mode)) {}
 
   bool start() override {
     if (running_.exchange(true))
@@ -1120,6 +1400,17 @@ public:
     return last_h_;
   }
 
+  bool request_ffc() override {
+    if (mode_ != "pt3") {
+      log(LogLevel::WARN,
+          "FFC request ignored: control is available only in --mode pt3.");
+      return false;
+    }
+    ffc_requested_.store(true);
+    log(LogLevel::INFO, "FFC request queued.");
+    return true;
+  }
+
 private:
   std::unique_ptr<IFrameSource> make_source() {
     if (mode_ == "dummy") {
@@ -1128,7 +1419,7 @@ private:
     } else if (mode_ == "pt3") {
 #ifdef USE_LIBUVC
       return std::make_unique<PT3Source>(fps_, fps_auto_, assume_tlinear_,
-                                         scale_);
+                                         scale_, ffc_mode_);
 #else
       return nullptr;
 #endif
@@ -1226,6 +1517,13 @@ private:
         }
       } else {
         bool keep = true;
+        if (ffc_requested_.exchange(false)) {
+          const bool ok = local->request_ffc();
+          if (!ok) {
+            log(LogLevel::WARN, "FFC request failed.");
+          }
+        }
+
         auto opt = local->latest();
 
         if (opt) {
@@ -1286,6 +1584,7 @@ private:
   bool fps_auto_;
   bool assume_tlinear_;
   uint16_t scale_;
+  std::string ffc_mode_;
 
   std::atomic<bool> running_{false};
   std::thread th_;
@@ -1293,6 +1592,7 @@ private:
   std::unique_ptr<IFrameSource> cur_;
   uint16_t last_w_{0};
   uint16_t last_h_{0};
+  std::atomic<bool> ffc_requested_{false};
 };
 
 // ===== Main =====
@@ -1307,12 +1607,13 @@ int main(int argc, char **argv) {
   }
 
   std::unique_ptr<IFrameSource> src = std::make_unique<SourceMonitor>(
-      args.mode, args.fps, args.fps_auto, args.assume_tlinear, args.scale);
+      args.mode, args.fps, args.fps_auto, args.assume_tlinear, args.scale,
+      args.ffc_mode);
 
   (void)src->start();
 
   asio::io_context ioc{1};
-  Hub hub;
+  Hub hub([&src] { return src->request_ffc(); });
 
   auto listener = std::make_shared<Listener>(
       ioc, tcp::endpoint{asio::ip::make_address("127.0.0.1"), args.port}, hub);
@@ -1358,7 +1659,8 @@ int main(int argc, char **argv) {
           std::to_string(args.port) + " mode=" + args.mode +
           (args.fps_auto ? " fps=auto" : (" fps=" + std::to_string(args.fps))) +
           " assume_tlinear=" + yesno(args.assume_tlinear) +
-          " scale=" + std::to_string(args.scale));
+          " scale=" + std::to_string(args.scale) +
+          " ffc_mode=" + args.ffc_mode);
 
   ioc.run();
 
