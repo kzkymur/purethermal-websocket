@@ -14,17 +14,10 @@ The demo client shown above is [webcv-platform](https://github.com/kzkymur/webcv
 
 ## Build
 
-```sh
-cmake . & make
-```
-
 Lepton SDK based FFC control is always enabled.  
 The SDK is consumed from the submodule at `external/GetThermal/lepton_sdk`.
 
 ```sh
-# first time only (if you are adding the submodule in this repository)
-git submodule add https://github.com/groupgets/GetThermal.git external/GetThermal
-
 # after clone / on update
 git submodule update --init --recursive
 
