@@ -29,19 +29,19 @@ cmake --build build -j
 ## Run
 
 ```sh
-sudo ./lepton_ws_server --mode pt3
+sudo ./build/lepton_ws_server --mode pt3
 ```
 
 ### Run (scale=10)
 
 ```sh
-./lepton_ws_server --mode dummy --scale 10 --fps 9
+./build/lepton_ws_server --mode dummy --scale 10 --fps 9
 ```
 
 ### Dummy Mode
 
 ```sh
-./lepton_ws_server --mode dummy
+./build/lepton_ws_server --mode dummy
 ```
 
 ### Options
