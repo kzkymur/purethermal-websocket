@@ -45,5 +45,8 @@ CMakeFiles/
 
 lepton_ws_server
 
-build
+build/
+build-*/
+*.y16
+*.avi
 Makefile

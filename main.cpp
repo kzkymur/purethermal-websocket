@@ -1,32 +1,38 @@
-#include <boost/asio.hpp>
-#include <boost/beast.hpp>
-#include <boost/beast/core/flat_buffer.hpp>
-#include <boost/beast/core/buffers_to_string.hpp>
-#include <boost/beast/websocket.hpp>
-
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <deque>
-#include <functional>
+#include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
-namespace asio = boost::asio;
-namespace beast = boost::beast;
-namespace ws = beast::websocket;
-using tcp = asio::ip::tcp;
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <mfapi.h>
+#include <mferror.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <wrl/client.h>
+#ifdef ERROR
+#undef ERROR
+#endif
+#endif
 
 // ===== Protocol =====
 //
@@ -287,6 +293,305 @@ private:
   std::mutex mu_;
   std::optional<Frame> latest_;
 };
+
+#if defined(_WIN32)
+class WindowsPT3Source : public IFrameSource {
+public:
+  WindowsPT3Source(bool assume_tlinear, uint16_t scale)
+      : assume_tlinear_(assume_tlinear), scale_(scale) {}
+
+  bool start() override {
+    if (running_.exchange(true))
+      return true;
+    startup_complete_.store(false);
+    startup_ok_.store(false);
+    thread_ = std::thread([this] { capture_loop(); });
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!startup_complete_.load() &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!startup_ok_.load()) {
+      stop();
+      return false;
+    }
+    return true;
+  }
+
+  void stop() override {
+    running_.store(false);
+    if (thread_.joinable())
+      thread_.join();
+  }
+
+  std::optional<Frame> latest() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return latest_;
+  }
+
+  uint16_t width() const override { return width_.load(); }
+  uint16_t height() const override { return height_.load(); }
+
+private:
+  template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
+
+  static bool is_y16(const GUID &subtype) {
+    constexpr uint32_t kY16Fourcc =
+        static_cast<uint32_t>('Y') | (static_cast<uint32_t>('1') << 8) |
+        (static_cast<uint32_t>('6') << 16) | (static_cast<uint32_t>(' ') << 24);
+    return subtype.Data1 == kY16Fourcc;
+  }
+
+  void fail_start(const std::string &message) {
+    log(LogLevel::ERROR, message);
+    startup_ok_.store(false);
+    startup_complete_.store(true);
+    running_.store(false);
+  }
+
+  void capture_loop() {
+    constexpr DWORD kVideoStreamIndex = 0;
+    const HRESULT com_hr =
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitialize_com = SUCCEEDED(com_hr);
+    if (FAILED(com_hr) && com_hr != RPC_E_CHANGED_MODE) {
+      fail_start("CoInitializeEx failed: " + std::to_string(com_hr));
+      return;
+    }
+
+    HRESULT hr = MFStartup(MF_VERSION);
+    if (FAILED(hr)) {
+      fail_start("MFStartup failed: " + std::to_string(hr));
+      if (uninitialize_com)
+        CoUninitialize();
+      return;
+    }
+
+    ComPtr<IMFAttributes> attributes;
+    hr = MFCreateAttributes(&attributes, 1);
+    if (SUCCEEDED(hr)) {
+      hr = attributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                               MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+    }
+
+    IMFActivate **devices = nullptr;
+    UINT32 device_count = 0;
+    if (SUCCEEDED(hr))
+      hr = MFEnumDeviceSources(attributes.Get(), &devices, &device_count);
+
+    ComPtr<IMFActivate> selected;
+    for (UINT32 i = 0; SUCCEEDED(hr) && i < device_count; ++i) {
+      wchar_t *name = nullptr;
+      UINT32 name_length = 0;
+      if (SUCCEEDED(devices[i]->GetAllocatedString(
+              MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &name, &name_length))) {
+        const std::wstring friendly(name, name_length);
+        if (friendly.find(L"PureThermal") != std::wstring::npos)
+          selected = devices[i];
+        CoTaskMemFree(name);
+      }
+      devices[i]->Release();
+    }
+    CoTaskMemFree(devices);
+
+    if (!selected) {
+      fail_start("PureThermal camera was not found by Windows Media Foundation.");
+      MFShutdown();
+      if (uninitialize_com)
+        CoUninitialize();
+      return;
+    }
+
+    ComPtr<IMFMediaSource> media_source;
+    hr = selected->ActivateObject(IID_PPV_ARGS(&media_source));
+    ComPtr<IMFSourceReader> reader;
+    if (SUCCEEDED(hr))
+      hr = MFCreateSourceReaderFromMediaSource(media_source.Get(), nullptr,
+                                               &reader);
+    if (FAILED(hr)) {
+      fail_start("Failed to create the PureThermal Media Foundation source "
+                 "reader: " +
+                 std::to_string(hr));
+      if (media_source)
+        media_source->Shutdown();
+      MFShutdown();
+      if (uninitialize_com)
+        CoUninitialize();
+      return;
+    }
+
+    ComPtr<IMFMediaType> selected_type;
+    UINT32 selected_width = 0;
+    UINT32 selected_height = 0;
+    DWORD selected_stream_index = kVideoStreamIndex;
+    ComPtr<IMFPresentationDescriptor> presentation;
+    if (SUCCEEDED(hr))
+      hr = media_source->CreatePresentationDescriptor(&presentation);
+    DWORD stream_count = 0;
+    if (SUCCEEDED(hr))
+      hr = presentation->GetStreamDescriptorCount(&stream_count);
+    log(LogLevel::INFO,
+        "PureThermal presentation: hr=" + std::to_string(hr) +
+            " streams=" + std::to_string(stream_count));
+
+    for (DWORD stream = 0; SUCCEEDED(hr) && stream < stream_count &&
+                           !selected_type;
+         ++stream) {
+      BOOL stream_selected = FALSE;
+      ComPtr<IMFStreamDescriptor> descriptor;
+      if (FAILED(presentation->GetStreamDescriptorByIndex(
+              stream, &stream_selected, &descriptor)))
+        continue;
+      ComPtr<IMFMediaTypeHandler> handler;
+      if (FAILED(descriptor->GetMediaTypeHandler(&handler)))
+        continue;
+      GUID major_type{};
+      if (FAILED(handler->GetMajorType(&major_type)) ||
+          major_type != MFMediaType_Video)
+        continue;
+
+      DWORD type_count = 0;
+      if (FAILED(handler->GetMediaTypeCount(&type_count)))
+        continue;
+      for (DWORD index = 0; index < type_count; ++index) {
+        ComPtr<IMFMediaType> type;
+        if (FAILED(handler->GetMediaTypeByIndex(index, &type)))
+          continue;
+
+        GUID subtype{};
+        UINT32 w = 0;
+        UINT32 h = 0;
+        const bool has_subtype =
+            SUCCEEDED(type->GetGUID(MF_MT_SUBTYPE, &subtype));
+        const bool has_size = SUCCEEDED(
+            MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &w, &h));
+        if (has_subtype && has_size) {
+          char format_log[180];
+          const uint32_t fourcc = subtype.Data1;
+          std::snprintf(
+              format_log, sizeof(format_log),
+              "PureThermal stream[%lu] format[%lu]: fourcc='%c%c%c%c' "
+              "data1=0x%08lx %lux%lu",
+              static_cast<unsigned long>(stream),
+              static_cast<unsigned long>(index),
+              static_cast<char>(fourcc & 0xff),
+              static_cast<char>((fourcc >> 8) & 0xff),
+              static_cast<char>((fourcc >> 16) & 0xff),
+              static_cast<char>((fourcc >> 24) & 0xff),
+              static_cast<unsigned long>(fourcc), static_cast<unsigned long>(w),
+              static_cast<unsigned long>(h));
+          log(LogLevel::INFO, format_log);
+        }
+        if (has_subtype && has_size && is_y16(subtype) &&
+            is_probe_candidate_size(static_cast<uint16_t>(w),
+                                    static_cast<uint16_t>(h))) {
+          selected_type = type;
+          selected_width = w;
+          selected_height = h;
+          selected_stream_index = stream;
+          if (w == 160 && h == 120)
+            break;
+        }
+      }
+    }
+
+    if (!selected_type) {
+      fail_start("PureThermal does not expose a Y16 160x120/160x122/80x60 "
+                 "Media Foundation format.");
+      if (media_source)
+        media_source->Shutdown();
+      MFShutdown();
+      if (uninitialize_com)
+        CoUninitialize();
+      return;
+    }
+
+    hr = reader->SetCurrentMediaType(selected_stream_index, nullptr,
+                                     selected_type.Get());
+    if (FAILED(hr)) {
+      fail_start("Failed to select the PureThermal Y16 format: " +
+                 std::to_string(hr));
+      media_source->Shutdown();
+      MFShutdown();
+      if (uninitialize_com)
+        CoUninitialize();
+      return;
+    }
+
+    width_.store(static_cast<uint16_t>(selected_width));
+    height_.store(static_cast<uint16_t>(selected_height));
+    startup_ok_.store(true);
+    startup_complete_.store(true);
+    log(LogLevel::INFO,
+        "Windows Media Foundation opened PureThermal Y16 " +
+            std::to_string(selected_width) + "x" +
+            std::to_string(selected_height));
+
+    uint32_t frame_id = 0;
+    while (running_.load()) {
+      DWORD stream_index = 0;
+      DWORD flags = 0;
+      LONGLONG timestamp = 0;
+      ComPtr<IMFSample> sample;
+      hr = reader->ReadSample(selected_stream_index, 0, &stream_index, &flags,
+                              &timestamp, &sample);
+      if (FAILED(hr)) {
+        log(LogLevel::ERROR,
+            "PureThermal ReadSample failed: " + std::to_string(hr));
+        break;
+      }
+      if (!sample)
+        continue;
+
+      ComPtr<IMFMediaBuffer> buffer;
+      if (FAILED(sample->ConvertToContiguousBuffer(&buffer)))
+        continue;
+      BYTE *data = nullptr;
+      DWORD max_length = 0;
+      DWORD length = 0;
+      if (FAILED(buffer->Lock(&data, &max_length, &length)))
+        continue;
+
+      const size_t pixel_count =
+          static_cast<size_t>(selected_width) * selected_height;
+      if (length >= pixel_count * sizeof(uint16_t)) {
+        Frame frame;
+        fill_frame_header(
+            frame.hdr,
+            assume_tlinear_ ? kFormatUint16TLinearKelvin
+                            : kFormatUint16RawUnknown,
+            assume_tlinear_ ? scale_ : 0, static_cast<uint16_t>(selected_width),
+            static_cast<uint16_t>(selected_height), frame_id++);
+        frame.pixels.resize(pixel_count);
+        std::memcpy(frame.pixels.data(), data,
+                    pixel_count * sizeof(uint16_t));
+        std::lock_guard<std::mutex> lock(mutex_);
+        latest_ = std::move(frame);
+      }
+      buffer->Unlock();
+    }
+
+    running_.store(false);
+    media_source->Shutdown();
+    MFShutdown();
+    if (uninitialize_com)
+      CoUninitialize();
+  }
+
+  bool assume_tlinear_;
+  uint16_t scale_;
+  std::atomic<bool> running_{false};
+  std::atomic<bool> startup_complete_{false};
+  std::atomic<bool> startup_ok_{false};
+  std::atomic<uint16_t> width_{0};
+  std::atomic<uint16_t> height_{0};
+  std::thread thread_;
+  std::mutex mutex_;
+  std::optional<Frame> latest_;
+};
+#endif
 
 #ifdef USE_LIBUVC
 #include <libuvc/libuvc.h>
@@ -1067,6 +1372,7 @@ private:
 
 // ===== WebSocket session =====
 
+#if 0
 class Hub;
 
 class Session : public std::enable_shared_from_this<Session> {
@@ -1270,17 +1576,23 @@ static std::shared_ptr<std::vector<uint8_t>> pack_frame(const Frame &f) {
               npx * sizeof(uint16_t));
   return msg;
 }
+#endif
 
 // ===== Args =====
 
 struct Args {
   std::string mode = "dummy"; // dummy | pt3
-  uint16_t port = 8765;
   double fps = 9.0;
   bool fps_auto = true;
   uint16_t scale = kDefaultScaleKelvin;
   bool assume_tlinear = true;
   std::string ffc_mode = "manual"; // manual | auto | external
+  std::string output = "capture.y16";
+  std::string video_output;
+  double duration_seconds = 10.0;
+  uint64_t frame_limit = 0;
+  double video_min_c = 20.0;
+  double video_max_c = 40.0;
 };
 
 static Args parse_args(int argc, char **argv) {
@@ -1299,10 +1611,33 @@ static Args parse_args(int argc, char **argv) {
       std::string v;
       next(v);
       a.mode = v;
-    } else if (s == "--port") {
+    } else if (s == "--output" || s == "-o") {
       std::string v;
       next(v);
-      a.port = static_cast<uint16_t>(std::stoi(v));
+      a.output = v;
+    } else if (s == "--duration") {
+      std::string v;
+      next(v);
+      a.duration_seconds = std::stod(v);
+      if (a.duration_seconds < 0.0)
+        throw std::runtime_error("--duration must be >= 0");
+    } else if (s == "--frames") {
+      std::string v;
+      next(v);
+      const auto parsed = std::stoll(v);
+      if (parsed <= 0)
+        throw std::runtime_error("--frames must be > 0");
+      a.frame_limit = static_cast<uint64_t>(parsed);
+    } else if (s == "--video-output") {
+      next(a.video_output);
+    } else if (s == "--video-min-c") {
+      std::string v;
+      next(v);
+      a.video_min_c = std::stod(v);
+    } else if (s == "--video-max-c") {
+      std::string v;
+      next(v);
+      a.video_max_c = std::stod(v);
     } else if (s == "--fps") {
       std::string v;
       next(v);
@@ -1335,11 +1670,13 @@ static Args parse_args(int argc, char **argv) {
       a.ffc_mode = v;
     } else if (s == "--help" || s == "-h") {
       std::cout
-          << "Usage: lepton_ws_server [--mode dummy|pt3] [--port 8765] "
+          << "Usage: lepton_capture [--mode dummy|pt3] [-o capture.y16] "
+             "[--duration SEC|--frames NUM] "
+             "[--video-output capture.avi] "
+             "[--video-min-c NUM] [--video-max-c NUM] "
              "[--fps auto|NUM] [--scale NUM] [--assume-tlinear|--no-assume-tlinear] "
              "[--ffc-mode manual|auto|external]\n"
-             "Protocol: 32-byte header + uint16 pixels (little-endian)\n"
-             "Header.format: 0=RAW_UNKNOWN, 1=UINT16_TLINEAR_KELVIN\n"
+             "Output: headerless little-endian uint16 (gray16le) frames.\n"
              "デフォルトは format=1/scale=--scale。RAWとして配信したい場合のみ\n"
              "--no-assume-tlinear を指定してください。\n";
       std::exit(0);
@@ -1414,10 +1751,13 @@ public:
 private:
   std::unique_ptr<IFrameSource> make_source() {
     if (mode_ == "dummy") {
-      return std::make_unique<DummySource>(160, 120, fps_, assume_tlinear_,
-                                           scale_);
+      return std::make_unique<DummySource>(static_cast<uint16_t>(160),
+                                           static_cast<uint16_t>(120), fps_,
+                                           assume_tlinear_, scale_);
     } else if (mode_ == "pt3") {
-#ifdef USE_LIBUVC
+#if defined(_WIN32)
+      return std::make_unique<WindowsPT3Source>(assume_tlinear_, scale_);
+#elif defined(USE_LIBUVC)
       return std::make_unique<PT3Source>(fps_, fps_auto_, assume_tlinear_,
                                          scale_, ffc_mode_);
 #else
@@ -1597,6 +1937,227 @@ private:
 
 // ===== Main =====
 
+class AviWriter {
+public:
+  bool open(const std::string &path, uint16_t width, uint16_t height,
+            double fps) {
+    width_ = width;
+    height_ = height;
+    row_bytes_ = (static_cast<uint32_t>(width_) * 3u + 3u) & ~3u;
+    frame_bytes_ = row_bytes_ * height_;
+    out_.open(path, std::ios::binary | std::ios::trunc);
+    if (!out_)
+      return false;
+
+    fourcc("RIFF");
+    riff_size_pos_ = out_.tellp();
+    u32(0);
+    fourcc("AVI ");
+
+    fourcc("LIST");
+    const auto hdrl_size_pos = out_.tellp();
+    u32(0);
+    const auto hdrl_start = out_.tellp();
+    fourcc("hdrl");
+
+    fourcc("avih");
+    u32(56);
+    u32(static_cast<uint32_t>(1000000.0 / fps));
+    u32(static_cast<uint32_t>(frame_bytes_ * fps));
+    u32(0);
+    u32(0x10); // AVIF_HASINDEX
+    total_frames_pos_ = out_.tellp();
+    u32(0);
+    u32(0);
+    u32(1);
+    u32(frame_bytes_);
+    u32(width_);
+    u32(height_);
+    for (int i = 0; i < 4; ++i)
+      u32(0);
+
+    fourcc("LIST");
+    const auto strl_size_pos = out_.tellp();
+    u32(0);
+    const auto strl_start = out_.tellp();
+    fourcc("strl");
+
+    fourcc("strh");
+    u32(56);
+    fourcc("vids");
+    fourcc("DIB ");
+    u32(0);
+    u16(0);
+    u16(0);
+    u32(0);
+    u32(1000);
+    u32(static_cast<uint32_t>(std::lround(fps * 1000.0)));
+    u32(0);
+    stream_length_pos_ = out_.tellp();
+    u32(0);
+    u32(frame_bytes_);
+    u32(0xffffffffu);
+    u32(0);
+    u16(0);
+    u16(0);
+    u16(width_);
+    u16(height_);
+
+    fourcc("strf");
+    u32(40);
+    u32(40);
+    u32(width_);
+    u32(height_); // positive height: bottom-up BGR rows
+    u16(1);
+    u16(24);
+    u32(0);
+    u32(frame_bytes_);
+    u32(0);
+    u32(0);
+    u32(0);
+    u32(0);
+
+    const auto after_strl = out_.tellp();
+    patch_u32(strl_size_pos,
+              static_cast<uint32_t>(after_strl - strl_start));
+    patch_u32(hdrl_size_pos,
+              static_cast<uint32_t>(after_strl - hdrl_start));
+
+    fourcc("LIST");
+    movi_size_pos_ = out_.tellp();
+    u32(0);
+    movi_start_ = out_.tellp();
+    fourcc("movi");
+    return out_.good();
+  }
+
+  bool write_frame(const Frame &frame, double min_c, double max_c) {
+    if (!out_ || frame.hdr.width != width_ || frame.hdr.height != height_ ||
+        frame.hdr.scale == 0 || max_c <= min_c)
+      return false;
+
+    const auto chunk_pos = out_.tellp();
+    fourcc("00db");
+    u32(frame_bytes_);
+    index_offsets_.push_back(
+        static_cast<uint32_t>(chunk_pos - movi_start_));
+
+    row_.assign(row_bytes_, 0);
+    for (int y = static_cast<int>(height_) - 1; y >= 0; --y) {
+      for (uint16_t x = 0; x < width_; ++x) {
+        const uint16_t value =
+            frame.pixels[static_cast<size_t>(y) * width_ + x];
+        const double celsius =
+            static_cast<double>(value) / frame.hdr.scale - 273.15;
+        const double t =
+            std::clamp((celsius - min_c) / (max_c - min_c), 0.0, 1.0);
+        const auto rgb = thermal_color(t);
+        const size_t dst = static_cast<size_t>(x) * 3;
+        row_[dst] = rgb[2];
+        row_[dst + 1] = rgb[1];
+        row_[dst + 2] = rgb[0];
+      }
+      out_.write(reinterpret_cast<const char *>(row_.data()), row_.size());
+    }
+    ++frames_;
+    return out_.good();
+  }
+
+  bool close() {
+    if (!out_)
+      return false;
+    const auto movi_end = out_.tellp();
+    patch_u32(movi_size_pos_,
+              static_cast<uint32_t>(movi_end - movi_start_));
+
+    fourcc("idx1");
+    u32(static_cast<uint32_t>(index_offsets_.size() * 16u));
+    for (const uint32_t offset : index_offsets_) {
+      fourcc("00db");
+      u32(0x10);
+      u32(offset);
+      u32(frame_bytes_);
+    }
+
+    const auto file_end = out_.tellp();
+    patch_u32(total_frames_pos_, frames_);
+    patch_u32(stream_length_pos_, frames_);
+    patch_u32(riff_size_pos_,
+              static_cast<uint32_t>(file_end - std::streampos(0)) - 8u);
+    out_.seekp(file_end);
+    out_.close();
+    return out_.good();
+  }
+
+private:
+  static std::array<uint8_t, 3> thermal_color(double t) {
+    const double x = t * 4.0;
+    const auto byte = [](double value) {
+      return static_cast<uint8_t>(
+          std::lround(std::clamp(value, 0.0, 1.0) * 255.0));
+    };
+    if (x < 1.0)
+      return {0, byte(x), 255};
+    if (x < 2.0)
+      return {0, 255, byte(2.0 - x)};
+    if (x < 3.0)
+      return {byte(x - 2.0), 255, 0};
+    return {255, byte(4.0 - x), 0};
+  }
+
+  void fourcc(const char *value) { out_.write(value, 4); }
+  void u16(uint16_t value) {
+    const char bytes[2] = {static_cast<char>(value),
+                           static_cast<char>(value >> 8)};
+    out_.write(bytes, sizeof(bytes));
+  }
+  void u32(uint32_t value) {
+    const char bytes[4] = {
+        static_cast<char>(value), static_cast<char>(value >> 8),
+        static_cast<char>(value >> 16), static_cast<char>(value >> 24)};
+    out_.write(bytes, sizeof(bytes));
+  }
+  void patch_u32(std::streampos position, uint32_t value) {
+    const auto current = out_.tellp();
+    out_.seekp(position);
+    u32(value);
+    out_.seekp(current);
+  }
+
+  std::ofstream out_;
+  uint16_t width_{0};
+  uint16_t height_{0};
+  uint32_t row_bytes_{0};
+  uint32_t frame_bytes_{0};
+  uint32_t frames_{0};
+  std::streampos riff_size_pos_{};
+  std::streampos total_frames_pos_{};
+  std::streampos stream_length_pos_{};
+  std::streampos movi_size_pos_{};
+  std::streampos movi_start_{};
+  std::vector<uint8_t> row_;
+  std::vector<uint32_t> index_offsets_;
+};
+
+static std::atomic<bool> g_recording{true};
+
+static void on_signal(int) { g_recording.store(false); }
+
+static bool write_y16_frame(std::ofstream &out, const Frame &frame) {
+  if constexpr (std::endian::native == std::endian::little) {
+    out.write(reinterpret_cast<const char *>(frame.pixels.data()),
+              static_cast<std::streamsize>(frame.pixels.size() *
+                                           sizeof(uint16_t)));
+  } else {
+    for (const uint16_t pixel : frame.pixels) {
+      const char bytes[2] = {static_cast<char>(pixel & 0xff),
+                             static_cast<char>(pixel >> 8)};
+      out.write(bytes, sizeof(bytes));
+    }
+  }
+  return out.good();
+}
+
 int main(int argc, char **argv) {
   Args args;
   try {
@@ -1606,66 +2167,136 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  std::unique_ptr<IFrameSource> src = std::make_unique<SourceMonitor>(
+  if (args.mode != "dummy" && args.mode != "pt3") {
+    std::cerr << "Arg error: --mode must be dummy or pt3\n";
+    return 1;
+  }
+  if (args.video_max_c <= args.video_min_c) {
+    std::cerr << "Arg error: --video-max-c must be greater than "
+                 "--video-min-c\n";
+    return 1;
+  }
+  if (args.video_output.empty()) {
+    std::filesystem::path video_path(args.output);
+    video_path.replace_extension(".avi");
+    args.video_output = video_path.string();
+  }
+  if (std::filesystem::path(args.output) ==
+      std::filesystem::path(args.video_output)) {
+    std::cerr << "Arg error: Y16 and AVI output paths must be different\n";
+    return 1;
+  }
+#if !defined(_WIN32) && !defined(USE_LIBUVC)
+  if (args.mode == "pt3") {
+    std::cerr << "PT3 support is not included in this build. Install libuvc, "
+                 "initialize the Git submodules, and rebuild.\n";
+    return 1;
+  }
+#endif
+
+  std::ofstream output(args.output, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    std::cerr << "Cannot open output file: " << args.output << "\n";
+    return 2;
+  }
+
+  auto src = std::make_unique<SourceMonitor>(
       args.mode, args.fps, args.fps_auto, args.assume_tlinear, args.scale,
       args.ffc_mode);
 
-  (void)src->start();
-
-  asio::io_context ioc{1};
-  Hub hub([&src] { return src->request_ffc(); });
-
-  auto listener = std::make_shared<Listener>(
-      ioc, tcp::endpoint{asio::ip::make_address("127.0.0.1"), args.port}, hub);
-  listener->run();
-
-  std::atomic<bool> running{true};
-
-  std::thread broadcaster([&] {
-    using namespace std::chrono;
-    uint32_t last_id = UINT32_MAX;
-
-    if (!args.fps_auto) {
-      const auto period = duration<double>(1.0 / args.fps);
-      auto next = steady_clock::now();
-
-      while (running.load()) {
-        next += duration_cast<steady_clock::duration>(period);
-
-        auto opt = src->latest();
-        if (opt && opt->hdr.frame_id != last_id) {
-          last_id = opt->hdr.frame_id;
-          hub.broadcast(pack_frame(*opt));
-        }
-
-        std::this_thread::sleep_until(next);
-      }
-    } else {
-      const auto poll = 1ms;
-      while (running.load()) {
-        auto opt = src->latest();
-        if (opt && opt->hdr.frame_id != last_id) {
-          last_id = opt->hdr.frame_id;
-          hub.broadcast(pack_frame(*opt));
-        } else {
-          std::this_thread::sleep_for(poll);
-        }
-      }
-    }
-  });
+  if (!src->start()) {
+    std::cerr << "Failed to start capture source\n";
+    return 3;
+  }
 
   log(LogLevel::INFO,
-      std::string("WebSocket server on ws://127.0.0.1:") +
-          std::to_string(args.port) + " mode=" + args.mode +
+      std::string("Recording to ") + args.output + " mode=" + args.mode +
           (args.fps_auto ? " fps=auto" : (" fps=" + std::to_string(args.fps))) +
           " assume_tlinear=" + yesno(args.assume_tlinear) +
-          " scale=" + std::to_string(args.scale) +
-          " ffc_mode=" + args.ffc_mode);
+          " scale=" + std::to_string(args.scale));
 
-  ioc.run();
+  std::signal(SIGINT, on_signal);
+  std::signal(SIGTERM, on_signal);
 
-  running.store(false);
-  broadcaster.join();
+  using namespace std::chrono;
+  const auto started = steady_clock::now();
+  uint32_t last_id = UINT32_MAX;
+  uint64_t frames_written = 0;
+  uint16_t width = 0;
+  uint16_t height = 0;
+  bool write_ok = true;
+  AviWriter video;
+  bool video_open = false;
+
+  while (g_recording.load()) {
+    if (args.frame_limit > 0 && frames_written >= args.frame_limit)
+      break;
+    if (args.frame_limit == 0 && args.duration_seconds > 0.0 &&
+        duration<double>(steady_clock::now() - started).count() >=
+            args.duration_seconds)
+      break;
+
+    auto frame = src->latest();
+    if (!frame || frame->hdr.frame_id == last_id) {
+      std::this_thread::sleep_for(1ms);
+      continue;
+    }
+    last_id = frame->hdr.frame_id;
+
+    if (frames_written == 0) {
+      width = frame->hdr.width;
+      height = frame->hdr.height;
+      video_open =
+          video.open(args.video_output, width, height, args.fps);
+      if (!video_open) {
+        log(LogLevel::ERROR,
+            "Cannot create RGB AVI output: " + args.video_output);
+        write_ok = false;
+        break;
+      }
+    } else if (frame->hdr.width != width || frame->hdr.height != height) {
+      log(LogLevel::ERROR,
+          "Frame dimensions changed while recording; stopping the file.");
+      write_ok = false;
+      break;
+    }
+
+    if (!write_y16_frame(output, *frame)) {
+      log(LogLevel::ERROR, "Failed while writing output file.");
+      write_ok = false;
+      break;
+    }
+    if (!video.write_frame(*frame, args.video_min_c, args.video_max_c)) {
+      log(LogLevel::ERROR,
+          "Failed while converting a frame to the RGB AVI output.");
+      write_ok = false;
+      break;
+    }
+    ++frames_written;
+  }
+
   src->stop();
+  output.close();
+  const bool video_ok = video_open && video.close();
+
+  const double elapsed =
+      duration<double>(steady_clock::now() - started).count();
+  log(LogLevel::INFO,
+      "Capture complete: frames=" + std::to_string(frames_written) +
+          " size=" + std::to_string(width) + "x" + std::to_string(height) +
+          " elapsed=" + std::to_string(elapsed) + "s output=" + args.output);
+  if (video_ok) {
+    log(LogLevel::INFO,
+        "RGB video complete: output=" + args.video_output + " range=" +
+            std::to_string(args.video_min_c) + ".." +
+            std::to_string(args.video_max_c) + " C");
+  }
+
+  if (!write_ok || !output.good() || !video_ok)
+    return 4;
+  if (frames_written == 0) {
+    log(LogLevel::ERROR, "No frames were captured.");
+    return 5;
+  }
   return 0;
 }
